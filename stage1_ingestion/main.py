@@ -1,118 +1,106 @@
-"""
-CompliSense Stage 1 - Knowledge Ingestion Script
-
-This script:
-- Parses PDFs from `data/input_documents/`
-- Chunks them into manageable segments
-- Uses Vertex AI embeddings (`textembedding-gecko@003`) to match content to known products/disclosures
-- Uses Vertex AI LLM (`chat-bison`) to extract structured YAML knowledge
-- Saves YAML to `normalized_knowledge/products/` and `.../disclosures/`
-"""
-
 import os
+import json
 import yaml
 from PyPDF2 import PdfReader
 from sklearn.metrics.pairwise import cosine_similarity
 from vertexai.language_models import TextEmbeddingModel, ChatModel
-from datetime import datetime
 
-# --- Configuration ---
-INPUT_DIR = "data/input_documents"
-PRODUCT_KB_DIR = "normalized_knowledge/products"
-DISCLOSURE_KB_DIR = "normalized_knowledge/disclosures"
-EMBEDDING_MODEL = "textembedding-gecko@003"
-LLM_MODEL = "chat-bison"
+# === CONFIG ===
+PRODUCT_PDF_PATH = "client_inputs/product_guide.pdf"
+DISCLOSURE_PDF_PATH = "client_inputs/risk_disclosures.pdf"
+FLAGS_PATH = "client_inputs/disclosure_flags.json"
+OUTPUT_PRODUCT_DIR = "normalized_knowledge/products"
+OUTPUT_DISCLOSURE_DIR = "normalized_knowledge/disclosures"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 MATCH_THRESHOLD = 0.75
 
-# --- Vertex AI Init ---
-embedding_model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL)
-chat_model = ChatModel.from_pretrained(LLM_MODEL)
+# === INIT MODELS ===
+embedding_model = TextEmbeddingModel.from_pretrained("textembedding-gecko@003")
+chat_model = ChatModel.from_pretrained("chat-bison")
 
+# === UTILITIES ===
 def parse_pdf(file_path):
-    print(f"📄 Reading PDF: {file_path}")
     reader = PdfReader(file_path)
     return "\n".join([page.extract_text() or "" for page in reader.pages])
 
 def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     tokens = text.split()
-    return [
-        " ".join(tokens[i:i+chunk_size])
-        for i in range(0, len(tokens), chunk_size - overlap)
-    ]
+    return [" ".join(tokens[i:i+chunk_size]) for i in range(0, len(tokens), chunk_size - overlap)]
 
-def get_known_entities(folder_path):
-    return [
-        f.replace(".yaml", "").replace("_", " ").title()
-        for f in os.listdir(folder_path) if f.endswith(".yaml")
-    ]
-
-def match_entity(text_chunk, candidates, threshold=MATCH_THRESHOLD):
-    chunk_vec = embedding_model.get_embeddings([text_chunk])[0].values
-    best_match, best_score = None, 0.0
-
-    for candidate in candidates:
-        cand_vec = embedding_model.get_embeddings([candidate])[0].values
-        score = cosine_similarity([chunk_vec], [cand_vec])[0][0]
-        if score > best_score and score >= threshold:
-            best_match = candidate
-            best_score = score
-
-    return best_match
-
-def extract_yaml_from_llm(name, content, entity_type):
-    print(f"🧠 Extracting structured {entity_type} for: {name}")
+def extract_entities_from_chunk(chunk, entity_type):
     prompt = f"""
-You are a compliance assistant. Extract structured YAML data for the {entity_type} "{name}" from the content below:
+You are a compliance assistant. Extract structured YAML for any {entity_type}s mentioned below.
+Only include YAML. If nothing is found, return nothing.
 
-{content}
+{chunk}
 """
     chat = chat_model.start_chat()
-    return chat.send_message(prompt).text  # Expecting LLM to return YAML directly
+    return chat.send_message(prompt).text.strip()
 
-def save_yaml(yaml_text, output_folder, name):
-    os.makedirs(output_folder, exist_ok=True)
-    filename = f"{name.lower().replace(' ', '_')}.yaml"
-    path = os.path.join(output_folder, filename)
-    try:
-        parsed = yaml.safe_load(yaml_text)
-        with open(path, "w") as f:
-            yaml.dump(parsed, f, sort_keys=False)
-        print(f"✅ Saved: {path}")
-    except Exception as e:
-        print(f"❌ Failed to parse/save YAML for {name}: {e}")
+def parse_yaml_blocks(yaml_text):
+    blocks = yaml_text.strip().split("---")
+    parsed = []
+    for block in blocks:
+        try:
+            parsed.append(yaml.safe_load(block))
+        except Exception:
+            continue
+    return [b for b in parsed if b]
 
-def main():
-    files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".pdf")]
-    known_products = get_known_entities(PRODUCT_KB_DIR)
-    known_disclosures = get_known_entities(DISCLOSURE_KB_DIR)
+def save_yaml(data, folder, name):
+    os.makedirs(folder, exist_ok=True)
+    file_name = f"{name.lower().replace(' ', '_')}.yaml"
+    with open(os.path.join(folder, file_name), "w") as f:
+        yaml.dump(data, f, sort_keys=False)
+    print(f"✅ Saved: {folder}/{file_name}")
 
-    for file in files:
-        path = os.path.join(INPUT_DIR, file)
-        chunks = chunk_text(parse_pdf(path))
-        buffer = {"products": {}, "disclosures": {}}
+def load_flags(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {"required_disclosures": []}
 
-        for chunk in chunks:
-            product = match_entity(chunk, known_products)
-            if product:
-                buffer["products"].setdefault(product, "")
-                buffer["products"][product] += chunk + "\n"
-            else:
-                disclosure = match_entity(chunk, known_disclosures)
-                if disclosure:
-                    buffer["disclosures"].setdefault(disclosure, "")
-                    buffer["disclosures"][disclosure] += chunk + "\n"
+# === PIPELINE ===
+def run_entity_extraction_pipeline():
+    print("🚀 Starting entity extraction pipeline...")
 
-        for name, content in buffer["products"].items():
-            yaml_text = extract_yaml_from_llm(name, content, "product")
-            save_yaml(yaml_text, PRODUCT_KB_DIR, name)
+    # Step 1: Extract from product guide
+    product_text = parse_pdf(PRODUCT_PDF_PATH)
+    product_chunks = chunk_text(product_text)
 
-        for name, content in buffer["disclosures"].items():
-            yaml_text = extract_yaml_from_llm(name, content, "disclosure")
-            save_yaml(yaml_text, DISCLOSURE_KB_DIR, name)
+    product_entities = []
+    for chunk in product_chunks:
+        response = extract_entities_from_chunk(chunk, "product")
+        if response:
+            product_entities.extend(parse_yaml_blocks(response))
 
-    print("🎉 Ingestion complete.")
+    for entity in product_entities:
+        name = entity.get("product_name", "unknown_product")
+        save_yaml(entity, OUTPUT_PRODUCT_DIR, name)
 
-if __name__ == "__main__":
-    main()
+    # Step 2: Extract from disclosure guide
+    disclosure_text = parse_pdf(DISCLOSURE_PDF_PATH)
+    disclosure_chunks = chunk_text(disclosure_text)
+
+    disclosure_entities = []
+    for chunk in disclosure_chunks:
+        response = extract_entities_from_chunk(chunk, "disclosure")
+        if response:
+            disclosure_entities.extend(parse_yaml_blocks(response))
+
+    for entity in disclosure_entities:
+        name = entity.get("disclosure_name", "unknown_disclosure")
+        save_yaml(entity, OUTPUT_DISCLOSURE_DIR, name)
+
+    # Step 3: Optional - Print disclosure flag status
+    flags = load_flags(FLAGS_PATH)
+    if flags["required_disclosures"]:
+        print("\n📋 Required Disclosures from Flags:")
+        for d in flags["required_disclosures"]:
+            print(f" - {d}")
+
+    print("\n✅ Entity extraction complete. Structured YAML files are ready.")
+
+# === RUN ===
+run_entity_extraction_pipeline()
